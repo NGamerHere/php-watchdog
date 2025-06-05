@@ -1,0 +1,201 @@
+#!/usr/bin/env php
+<?php
+
+if (!extension_loaded('pcntl')) {
+    echo "Error: PCNTL extension is not loaded. Please enable it in your php.ini.\n";
+    exit(1);
+}
+
+$targetScript = $argv[1] ?? null;
+$watchDir = getcwd();
+$pidFile = $watchDir . '/server.pid';
+$debounceTime = 1;
+$lastChangeTime = 0;
+
+$process = null;
+$processPipes = null;
+$processPid = null;
+
+function getPortsByPid(int $pid): array {
+    $ports = [];
+    $output = [];
+    exec("lsof -Pan -p {$pid} -iTCP -sTCP:LISTEN", $output);
+    foreach ($output as $line) {
+        if (preg_match('/TCP \S+:(\d+) \(LISTEN\)/', $line, $matches)) {
+            $ports[] = intval($matches[1]);
+        }
+    }
+    return array_unique($ports);
+}
+
+function killProcessesOnPorts(array $ports): void {
+    foreach ($ports as $port) {
+        $output = [];
+        exec("lsof -t -i tcp:{$port}", $output);
+        foreach ($output as $pid) {
+            echo "[php-watch] Killing process {$pid} on port {$port}\n";
+            posix_kill((int)$pid, SIGKILL);
+        }
+    }
+}
+
+function startApplication(string $script, &$process, &$processPipes, &$processPid) {
+    if (empty($script) || !file_exists($script)) {
+        echo "[php-watch] Error: Target script '{$script}' not found or not specified.\n";
+        exit(1);
+    }
+
+    echo "[php-watch] Starting application: php {$script}\n";
+
+    $descriptorspec = [
+        0 => ["pipe", "r"],
+        1 => ["pipe", "w"],
+        2 => ["pipe", "w"]
+    ];
+
+    $command = "php {$script}";
+    $process = proc_open($command, $descriptorspec, $processPipes);
+
+    if (is_resource($process)) {
+        $status = proc_get_status($process);
+        $processPid = $status['pid'];
+        echo "[php-watch] Application started with PID: {$processPid}\n";
+        stream_set_blocking($processPipes[1], false);
+        stream_set_blocking($processPipes[2], false);
+
+        sleep(1);
+        if (file_exists($GLOBALS['pidFile'])) {
+            $realPid = (int)file_get_contents($GLOBALS['pidFile']);
+            $ports = getPortsByPid($realPid);
+            echo "[php-watch] Real child PID: {$realPid} | Ports: " . implode(', ', $ports) . "\n";
+        }
+    } else {
+        echo "[php-watch] Failed to start application.\n";
+        $process = null;
+        $processPid = null;
+    }
+}
+
+function stopApplication(&$process, $pid) {
+    global $pidFile, $processPipes;
+
+    $realPid = null;
+    $ports = [];
+
+    if (file_exists($pidFile)) {
+        $realPid = (int)file_get_contents($pidFile);
+        echo "[php-watch] Found real child PID: $realPid\n";
+        $ports = getPortsByPid($realPid);
+    }
+
+    if ($process && is_resource($process) && $pid) {
+        echo "[php-watch] Stopping application with PID: {$pid}\n";
+        proc_terminate($process, SIGTERM);
+        sleep(3);
+
+        $status = proc_get_status($process);
+        if ($status['running']) {
+            echo "[php-watch] Application did not stop gracefully, forcing kill...\n";
+            posix_kill($pid, SIGKILL);
+        }
+
+        foreach ($processPipes as $pipe) {
+            if (is_resource($pipe)) {
+                fclose($pipe);
+            }
+        }
+
+        proc_close($process);
+        $process = null;
+        $processPid = null;
+        echo "[php-watch] Application stopped.\n";
+    }
+
+    if (!empty($ports)) {
+        killProcessesOnPorts($ports);
+    }
+}
+
+function restartApplication($script, &$process, &$processPipes, &$processPid) {
+    stopApplication($process, $processPid);
+    startApplication($script, $process, $processPipes, $processPid);
+}
+
+function readProcessOutput(&$processPipes) {
+    if (isset($processPipes[1]) && is_resource($processPipes[1])) {
+        while (($output = fgets($processPipes[1])) !== false) {
+            echo $output;
+        }
+    }
+    if (isset($processPipes[2]) && is_resource($processPipes[2])) {
+        while (($error = fgets($processPipes[2])) !== false) {
+            fwrite(STDERR, $error);
+        }
+    }
+}
+
+function getFileHashes($directory): array {
+    $hashes = [];
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($directory, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::LEAVES_ONLY
+    );
+
+    foreach ($iterator as $file) {
+        if ($file->isFile() && $file->getExtension() === 'php') {
+            $hashes[$file->getPathname()] = md5_file($file->getPathname());
+        }
+    }
+    return $hashes;
+}
+
+if ($targetScript === null) {
+    echo "Usage: php-watch <your_php_script.php>\n";
+    exit(1);
+}
+
+startApplication($targetScript, $process, $processPipes, $processPid);
+$watchedFiles = getFileHashes($watchDir);
+
+while (true) {
+    readProcessOutput($processPipes);
+
+    if ($process && is_resource($process)) {
+        $status = proc_get_status($process);
+        if (!$status['running']) {
+            echo "[php-watch] Application process exited unexpectedly. Restarting...\n";
+            restartApplication($targetScript, $process, $processPipes, $processPid);
+            $lastChangeTime = microtime(true);
+        }
+    } else {
+        echo "[php-watch] Application process not running. Attempting to start...\n";
+        startApplication($targetScript, $process, $processPipes, $processPid);
+        $lastChangeTime = microtime(true);
+    }
+
+    $currentFiles = getFileHashes($watchDir);
+    $changesDetected = false;
+
+    if (count(array_diff_key($watchedFiles, $currentFiles)) > 0 || count(array_diff_key($currentFiles, $watchedFiles)) > 0) {
+        $changesDetected = true;
+    } else {
+        foreach ($currentFiles as $file => $hash) {
+            if (!isset($watchedFiles[$file]) || $watchedFiles[$file] !== $hash) {
+                $changesDetected = true;
+                break;
+            }
+        }
+    }
+
+    if ($changesDetected) {
+        $currentTime = microtime(true);
+        if (($currentTime - $lastChangeTime) > $debounceTime) {
+            echo "[php-watch] File change detected. Restarting application...\n";
+            restartApplication($targetScript, $process, $processPipes, $processPid);
+            $lastChangeTime = $currentTime;
+        }
+        $watchedFiles = $currentFiles;
+    }
+
+    usleep(250000);
+}

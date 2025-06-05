@@ -1,0 +1,1 @@
+Auto-restart PHP script on file changes

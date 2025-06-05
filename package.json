@@ -1,0 +1,16 @@
+{
+  "name": "ncoderhere/php-watch",
+  "description": "Auto-restart PHP script on file changes",
+  "type": "project",
+  "license": "MIT",
+  "bin": ["bin/php-watch"],
+  "authors": [
+    {
+      "name": "N Datta sai ram kumar",
+      "email": "codingdatta@gmail.com"
+    }
+  ],
+  "require": {
+    "php": ">=7.4"
+  }
+}
