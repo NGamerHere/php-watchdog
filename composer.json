@@ -1,5 +1,5 @@
 {
-  "name": "ncoderhere/php-watch",
+  "name": "ncoderhere/php-watchdog",
   "description": "Auto-restart PHP script on file changes",
   "type": "project",
   "license": "MIT",
